@@ -1,0 +1,102 @@
+# Structured (JSON) access log.
+log_format json_access escape=json
+  '{"time":"$time_iso8601","request_id":"$request_id","remote_addr":"$remote_addr",'
+  '"method":"$request_method","uri":"$request_uri","status":$status,"bytes":$body_bytes_sent,'
+  '"request_time":$request_time,"upstream_time":"$upstream_response_time",'
+  '"upstream_addr":"$upstream_addr","limit_req":"$limit_req_status","user_agent":"$http_user_agent"}';
+
+upstream api_upstream {
+  # Docker DNS returns one A record per API replica (docker compose up --scale api=3);
+  # NGINX balances across them and stops sending to a replica that keeps failing.
+  # (NGINX resolves this name at startup: after recreating the api service, run `docker compose restart nginx`.)
+  least_conn;
+  server api:3000 max_fails=2 fail_timeout=5s;
+  keepalive 64;
+}
+
+# ---- Rate limiting (per client IP). Rates come from the environment; see the README. ----------
+limit_req_zone  $binary_remote_addr zone=rl_checkout:20m rate=${NGINX_RATE_CHECKOUT};
+limit_req_zone  $binary_remote_addr zone=rl_status:20m   rate=${NGINX_RATE_STATUS};
+limit_req_zone  $binary_remote_addr zone=rl_api:20m      rate=${NGINX_RATE_API};
+limit_conn_zone $binary_remote_addr zone=conn_per_ip:20m;
+limit_req_status  429;
+limit_conn_status 429;
+limit_req_log_level warn;
+
+server {
+  listen 80;
+  server_name _;
+  server_tokens off;
+
+  root /usr/share/nginx/html;
+  index index.html;
+
+  access_log /dev/stdout json_access;
+  error_log  /dev/stderr warn;
+
+  client_max_body_size 4k;
+  client_body_timeout 5s;
+  client_header_timeout 5s;
+  send_timeout 10s;
+  limit_conn conn_per_ip ${NGINX_MAX_CONN_PER_IP};
+
+  gzip on;
+  gzip_comp_level 5;
+  gzip_min_length 1024;
+  gzip_vary on;
+  gzip_types text/css application/javascript application/json image/svg+xml;
+
+  # Security headers. NOTE: a location that defines its own add_header drops these,
+  # so locations below only use `expires` unless stated otherwise.
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-Frame-Options "DENY" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+  add_header Cross-Origin-Opener-Policy "same-origin" always;
+  add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+
+  # Friendly JSON for rate-limited API calls (the frontend maps RATE_LIMITED to a clear message).
+  error_page 429 = @rate_limited;
+  location @rate_limited {
+    default_type application/json;
+    add_header Retry-After 1 always;
+    add_header Cache-Control "no-store" always;
+    return 429 '{"error":{"code":"RATE_LIMITED","message":"Too many requests. Please slow down."}}';
+  }
+
+  location = /healthz {
+    access_log off;
+    default_type text/plain;
+    return 200 "ok\n";
+  }
+
+  # Content-hashed build output: cache for a year. Safe to put behind a CDN.
+  location /assets/ {
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    try_files $uri =404;
+  }
+
+  # Checkout is the expensive, abusable endpoint: tightest limit. One human clicks once.
+  location = /api/checkout {
+    limit_req zone=rl_checkout burst=${NGINX_BURST_CHECKOUT} nodelay;
+    include /etc/nginx/conf.d/api_proxy.inc;
+  }
+
+  # Status polling (about 1 request/second per waiting buyer).
+  location /api/checkout/ {
+    limit_req zone=rl_status burst=${NGINX_BURST_STATUS} nodelay;
+    include /etc/nginx/conf.d/api_proxy.inc;
+  }
+
+  # Session, sale info, health.
+  location /api/ {
+    limit_req zone=rl_api burst=${NGINX_BURST_API} nodelay;
+    include /etc/nginx/conf.d/api_proxy.inc;
+  }
+
+  # index.html and SPA fallback must never be cached (it references the hashed assets).
+  location / {
+    expires -1;
+    try_files $uri /index.html;
+  }
+}

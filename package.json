@@ -1,0 +1,25 @@
+{
+  "name": "flash-sale",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Flash-sale system: convenience scripts only. Dependencies live in backend/ and frontend/.",
+  "scripts": {
+    "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "up": "docker compose up -d --build",
+    "down": "docker compose down",
+    "down:volumes": "docker compose down -v",
+    "ps": "docker compose ps",
+    "logs": "docker compose logs -f --tail=100",
+    "reset-sale": "docker compose run --rm init node src/scripts/resetSale.js",
+    "test": "npm --prefix backend test && npm --prefix frontend test",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "up:scaled": "docker compose up -d --build --scale api=3 --scale worker=2 && docker compose restart nginx",
+    "test:unit": "npm --prefix backend run test:unit && npm --prefix frontend test",
+    "test:integration": "npm --prefix backend run test:integration",
+    "reconcile": "docker compose run --rm init node src/scripts/reconcileInventory.js",
+    "reconcile:apply": "docker compose run --rm init node src/scripts/reconcileInventory.js --apply",
+    "simulate": "node backend/src/scripts/simulateBuyers.js",
+    "loadtest": "docker run --rm -i --add-host=host.docker.internal:host-gateway -e BASE_URL=${BASE_URL:-http://host.docker.internal:8081} grafana/k6 run - < loadtest/k6/checkout.js",
+    "bundle-size": "npm --prefix frontend run build && npm --prefix frontend run size"
+  }
+}

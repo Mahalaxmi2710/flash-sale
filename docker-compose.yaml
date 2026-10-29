@@ -1,0 +1,181 @@
+name: flash-sale
+
+# Least-privilege runtime for the Node services (they only need to write to /tmp).
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+
+x-backend-env: &backend-env
+  NODE_ENV: ${NODE_ENV:-production}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  LOG_ACCESS: ${LOG_ACCESS:-true}
+  PRODUCT_ID: ${PRODUCT_ID:-phone-x}
+  PRODUCT_NAME: ${PRODUCT_NAME:-Phoenix X Smartphone}
+  PRODUCT_PRICE_CENTS: ${PRODUCT_PRICE_CENTS:-49900}
+  SALE_STOCK: ${SALE_STOCK:-500}
+  SALE_START_DELAY_SECONDS: ${SALE_START_DELAY_SECONDS:-60}
+  SALE_START_AT: ${SALE_START_AT:-}
+  RESERVATION_TTL_SECONDS: ${RESERVATION_TTL_SECONDS:-30}
+  SESSION_SECRET: ${SESSION_SECRET:?Copy .env.example to .env and set SESSION_SECRET}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  DATABASE_URL: postgres://${POSTGRES_USER:-flash}:${POSTGRES_PASSWORD:-flash_pw}@postgres:5432/${POSTGRES_DB:-flashsale}
+  REDIS_URL: redis://redis:6379
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-flash}:${RABBITMQ_PASSWORD:-flash_pw}@rabbitmq:5672
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flash}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flash_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-flashsale}
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-flash}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-flash_pw}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # One-shot: apply migrations, then seed the sale if it has never been seeded.
+  init:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: flash-sale-backend:local
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: init
+    command: ["sh", "-c", "node src/scripts/migrate.js && node src/scripts/resetSale.js --if-missing"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: flash-sale-backend:local
+    init: true
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: api
+      PORT: "3000"
+    command: ["node", "src/api/server.js"]
+    <<: *hardened
+    expose:
+      - "3000"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health/live >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # Consumes checkout jobs from RabbitMQ and makes the final order/inventory decision in PostgreSQL.
+  # Same image as the API. Scale with: docker compose up -d --scale worker=3
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: flash-sale-backend:local
+    init: true
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: worker
+    command: ["node", "src/worker/worker.js"]
+    <<: *hardened
+    stop_grace_period: 20s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # The worker touches this file every 10 s while it is consuming.
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/worker.alive -mmin -1 2>/dev/null)\""]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    environment:
+      # Per-IP rate limits (see README, "Rate limiting"). Raise them when load-testing from one machine.
+      NGINX_RATE_CHECKOUT: ${NGINX_RATE_CHECKOUT:-5r/s}
+      NGINX_BURST_CHECKOUT: ${NGINX_BURST_CHECKOUT:-10}
+      NGINX_RATE_STATUS: ${NGINX_RATE_STATUS:-10r/s}
+      NGINX_BURST_STATUS: ${NGINX_BURST_STATUS:-20}
+      NGINX_RATE_API: ${NGINX_RATE_API:-20r/s}
+      NGINX_BURST_API: ${NGINX_BURST_API:-40}
+      NGINX_MAX_CONN_PER_IP: ${NGINX_MAX_CONN_PER_IP:-100}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitmqdata:

@@ -1,0 +1,30 @@
+{
+  "name": "flash-sale-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/api/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start:worker": "node src/worker/worker.js",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.5",
+    "express": "^5.1.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "pino-http": "^10.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0",
+    "vitest": "^2.1.8"
+  }
+}
